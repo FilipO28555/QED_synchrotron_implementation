@@ -4,3 +4,6 @@ Minimal implementation of QED synchrotron extension for PIC codes as described i
 # Dependencies
 Please install from requirements.txt as well as this library:
 https://github.com/sbarratt/torch_interpolations
+
+# Performance
+On mobile NVidia P3200 current setup: ~60ms per iteration
