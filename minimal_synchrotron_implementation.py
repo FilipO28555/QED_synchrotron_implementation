@@ -23,15 +23,16 @@ def F2(z_q):
 def precompute_F1_F2():
     print("Creating lookup tables for F1 and F2...")
     # cashed F2
-    x = np.logspace(-20, 10, 1280) 
+    x = np.logspace(-20, 2, 512) 
     valuesF2 = [F2(z) for z in x]
     valuesF2 = torch.tensor(valuesF2, device='cuda', dtype=torch.float64)
     x = [torch.tensor(x, device='cuda', dtype=torch.float64)]
     cashedF2 = interpolate(x, valuesF2)
     
     # cashed F1
-    x = np.logspace(-20, 10, 1280) # valid to delta = 1e-7
-    valuesF1 = [F1(z) if z > 2.8e-6 else 2.15* z**(1/3) for z in x]
+    x = np.logspace(-20, 2, 512) # valid to delta = 1e-7
+    valuesF1 = [F1(z) for z in x]
+    # failsafe for F1 if integration fails
     for i in range(len(valuesF1)-1,0,-1):
         if valuesF1[i] < 0:
             valuesF1[i] = 2.15* x[i]**(1/3) 
@@ -42,11 +43,6 @@ def precompute_F1_F2():
     
     return cashedF1, cashedF2
 cashedF1, cashedF2 = precompute_F1_F2()
-
-# expects numpy array
-def interpolateF(x, cashedF):
-    x = [torch.tensor(x, device='cuda', dtype=torch.float64)]
-    return cashedF(x)
 
 # expect cuda tensors
 def interpolateF_(x, cashedF):
@@ -132,27 +128,27 @@ El = a0*m_e*w*c/q #Electric field strength in V/m
                     #Time and space:
 Tperiod = 2*np.pi/w #Period of the laser
 substeps = 11
-dt = Tperiod/35 # 11*35 = 385 steps per period
+dt = Tperiod/10 # 11*35 = 385 steps per period
 dt /= substeps
 time = 0
 
 # for visualization -> full image is 10x10 laser periods
 kappa = w/c/2/np.pi # wave number
 scale = 1/kappa 
-scaleX = scale*10 
-scaleY = scale*10
+scaleX = scale*20 
+scaleY = scale*20
 
 
                     #Laser envelope:
 # parameters
-sigX = scale 
-sigY = scaleY/12
+sigX = scale #sigma = laser period
+sigY = scale*3
 def envelope(x):
     global time, sigX, sigY
     # sig = 1e-6
     x0 = (time)*c-scaleY/2
     y0 = scaleX/2
-    return torch.exp(-(x[:,1]-x0)**2/2/sigX**2) #* torch.exp(-(x[:,0]-y0)**2/sigY**2)
+    return torch.exp(-(x[:,1]-x0)**2/sigX**2) * torch.exp(-(x[:,0]-y0)**2/sigY**2)
 
 # define the laser field
 # x is a tensor of 3-tensors
@@ -184,21 +180,24 @@ def update_Boris(positions,velocities,dt):
     
     if SynchrotronQ:
         heff = Heff_CUDA(velocities,vmag.unsqueeze(-1), B, E ) 
-        # substepping
-        new_dt = calculate_dt(gamma, heff)
-        substeps = int(dt/new_dt)
-        substeps = substeps if substeps > 0 else 1
-        for _ in range(substeps):
-            # Generate photons
-            deltas = Generate_photon_CUDA(heff, gamma, new_dt)
-            # update momentum
-            momentum = momentum - momentum/torch.norm(momentum,dim=1).unsqueeze(-1) * (deltas*(gamma*m_e*c)).unsqueeze(-1)
-            # save energies to the list
-            mask = deltas > 0
-            deltas = deltas[mask]
-            energy = deltas*gamma[mask]*(m_e*c**2*6.2415e+18) # in eV
-            energy = energy.cpu().numpy()
-            energyAll.append(energy)
+        if heff.max() > 108635699/2:
+            # substepping
+            new_dt = calculate_dt(gamma, heff)
+            substeps = int(dt/new_dt)
+            substeps = substeps if substeps > 0 else 1
+            for _ in range(substeps):
+                # Generate photons
+                deltas = Generate_photon_CUDA(heff, gamma, new_dt)
+                # update momentum
+                momentum = momentum - momentum/torch.norm(momentum,dim=1).unsqueeze(-1) * (deltas*(gamma*m_e*c)).unsqueeze(-1)
+                # save energies to the list
+                mask = deltas > 0
+                # if mask.any():
+                #     print(f"heff = {heff.max().item()}")
+                deltas = deltas[mask]
+                energy = deltas*gamma[mask]*(m_e*c**2*6.2415e+18) # in eV
+                # energy = energy.cpu().numpy()
+                energyAll.append(energy)
         
     
     momMinus = momentum + q*E*dt/2
@@ -236,6 +235,32 @@ def draw_points(pos,img,color):
     img[rows, cols] += color
     return img, pos, (mask_x & mask_y)
 
+def plotEnergy(save=False):                    
+    energy = torch.cat(energyAll, dim=0).cpu().numpy()
+    if len(energyAll) == 0:
+        energy = [0]
+    # rescale energy to eV
+    energy = energy
+    
+    # histogram of the generated photons
+    minExp = np.floor(np.log10(np.min(energy)))
+    maxExp = np.ceil(np.log10(np.max(energy)))
+    bins = np.logspace(minExp, maxExp, 150)
+    a,b = np.histogram(energy,bins=bins)
+    # normalize on density
+    a = a*(b[1:]+b[:-1])/(b[1:]-b[:-1])/2
+    plt.bar(b[:-1],a,width=b[1:]-b[:-1])
+    # title
+    plt.title("Histogram of generated photons. Number of photons = " + str(len(energy)))
+    plt.xlabel("energy [eV]")
+    plt.ylabel("count/width")
+    plt.xscale('log')
+    plt.yscale('log')
+
+    plt.show()
+    plt.close()
+
+
 # Create some balls
 n_balls = 50_000
 maxBalls = 50_000
@@ -259,6 +284,7 @@ SIZE = 800 # size of the window
 start = timeit.time()+1
 iter = 0
 fps = 1
+plot_time = 1e-13
 while True:
     # FPS counter
     if iter%10==0:
@@ -274,6 +300,9 @@ while True:
     for _ in range(substeps):
         positions, velocities = update_Boris(positions,velocities,dt)
         time += dt
+        if time > plot_time:
+            plotEnergy(save=False)
+            plot_time += 1e-14
     
     # VISUALIZATION
     img = torch.zeros((SIZE, SIZE, 3), dtype=torch.uint8, device='cuda')
